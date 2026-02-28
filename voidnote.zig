@@ -77,6 +77,8 @@ pub const CreateOptions = struct {
     api_key: []const u8,
     title: ?[]const u8 = null,
     max_views: u8 = 1, // 1–100
+    expires_in: u16 = 24, // hours: 1, 6, 24, 72, 168, 720
+    note_type: []const u8 = "secure", // "secure" or "pipe"
     base: []const u8 = default_base,
 };
 
@@ -258,12 +260,17 @@ pub fn create(allocator: Allocator, content: []const u8, opts: CreateOptions) !C
 
     const max_views = if (opts.max_views == 0) @as(u8, 1) else opts.max_views;
 
+    const expires_in = if (opts.expires_in == 0) @as(u16, 24) else opts.expires_in;
+    const note_type = if (opts.note_type.len == 0) "secure" else opts.note_type;
+
     const body = try std.json.stringifyAlloc(allocator, .{
         .tokenId = token_id,
         .encryptedContent = enc.encrypted_hex,
         .iv = enc.iv_hex,
         .maxViews = max_views,
         .title = opts.title,
+        .expiresIn = expires_in,
+        .noteType = note_type,
     }, .{});
     defer allocator.free(body);
 
@@ -787,6 +794,161 @@ fn fillRandom(buf: []u8) void {
         },
         else => @compileError("unsupported platform for fillRandom"),
     }
+}
+
+// ── Buy / Credits API ─────────────────────────────────────────────────────────
+
+pub const CryptoOrderOptions = struct {
+    api_key: []const u8,
+    /// Amount of credits to purchase
+    credits: u32,
+    /// Cryptocurrency symbol, e.g. "BTC", "ETH", "LTC"
+    currency: []const u8,
+    base: []const u8 = default_base,
+};
+
+pub const CryptoOrder = struct {
+    order_id: []const u8,
+    address: []const u8,
+    amount: []const u8,
+    currency: []const u8,
+    expires_at: []const u8,
+
+    pub fn deinit(self: CryptoOrder, allocator: Allocator) void {
+        allocator.free(self.order_id);
+        allocator.free(self.address);
+        allocator.free(self.amount);
+        allocator.free(self.currency);
+        allocator.free(self.expires_at);
+    }
+};
+
+pub const SubmitPaymentOptions = struct {
+    api_key: []const u8,
+    /// Order ID returned by `createCryptoOrder`
+    order_id: []const u8,
+    /// On-chain transaction ID / hash
+    tx_id: []const u8,
+    base: []const u8 = default_base,
+};
+
+pub const SubmitPaymentResult = struct {
+    success: bool,
+    message: []const u8,
+
+    pub fn deinit(self: SubmitPaymentResult, allocator: Allocator) void {
+        allocator.free(self.message);
+    }
+};
+
+/// Create a crypto payment order to purchase credits. Requires an API key.
+/// Caller owns the returned CryptoOrder and must call `.deinit(allocator)`.
+pub fn createCryptoOrder(allocator: Allocator, opts: CryptoOrderOptions) !CryptoOrder {
+    if (opts.api_key.len == 0) return VoidNoteError.MissingApiKey;
+
+    const body = try std.json.stringifyAlloc(allocator, .{
+        .credits = opts.credits,
+        .currency = opts.currency,
+    }, .{});
+    defer allocator.free(body);
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/api/buy/crypto/create-order", .{opts.base});
+    defer allocator.free(url);
+
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{opts.api_key});
+    defer allocator.free(auth);
+
+    var resp_body = std.ArrayList(u8).init(allocator);
+    defer resp_body.deinit();
+
+    const status = try httpPost(allocator, url, auth, body, &resp_body);
+    if (status != 200 and status != 201) return VoidNoteError.HttpError;
+
+    const RawResult = struct {
+        orderId: ?[]const u8 = null,
+        order_id: ?[]const u8 = null,
+        address: ?[]const u8 = null,
+        amount: ?[]const u8 = null,
+        currency: ?[]const u8 = null,
+        expiresAt: ?[]const u8 = null,
+        expires_at: ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(
+        RawResult,
+        allocator,
+        resp_body.items,
+        .{ .ignore_unknown_fields = true },
+    ) catch return VoidNoteError.JsonParseError;
+    defer parsed.deinit();
+
+    const raw = parsed.value;
+    const order_id_raw = raw.orderId orelse raw.order_id orelse return VoidNoteError.JsonParseError;
+    const address_raw = raw.address orelse return VoidNoteError.JsonParseError;
+    const amount_raw = raw.amount orelse return VoidNoteError.JsonParseError;
+    const currency_raw = raw.currency orelse opts.currency;
+    const expires_at_raw = raw.expiresAt orelse raw.expires_at orelse "";
+
+    const order_id_copy = try allocator.dupe(u8, order_id_raw);
+    errdefer allocator.free(order_id_copy);
+    const address_copy = try allocator.dupe(u8, address_raw);
+    errdefer allocator.free(address_copy);
+    const amount_copy = try allocator.dupe(u8, amount_raw);
+    errdefer allocator.free(amount_copy);
+    const currency_copy = try allocator.dupe(u8, currency_raw);
+    errdefer allocator.free(currency_copy);
+    const expires_copy = try allocator.dupe(u8, expires_at_raw);
+
+    return CryptoOrder{
+        .order_id = order_id_copy,
+        .address = address_copy,
+        .amount = amount_copy,
+        .currency = currency_copy,
+        .expires_at = expires_copy,
+    };
+}
+
+/// Submit an on-chain transaction ID for a pending crypto order. Requires an API key.
+/// Caller owns the returned SubmitPaymentResult and must call `.deinit(allocator)`.
+pub fn submitCryptoPayment(allocator: Allocator, opts: SubmitPaymentOptions) !SubmitPaymentResult {
+    if (opts.api_key.len == 0) return VoidNoteError.MissingApiKey;
+
+    const body = try std.json.stringifyAlloc(allocator, .{
+        .orderId = opts.order_id,
+        .txId = opts.tx_id,
+    }, .{});
+    defer allocator.free(body);
+
+    const url = try std.fmt.allocPrint(allocator, "{s}/api/buy/crypto/submit-tx", .{opts.base});
+    defer allocator.free(url);
+
+    const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{opts.api_key});
+    defer allocator.free(auth);
+
+    var resp_body = std.ArrayList(u8).init(allocator);
+    defer resp_body.deinit();
+
+    const status = try httpPost(allocator, url, auth, body, &resp_body);
+    if (status != 200 and status != 201) return VoidNoteError.HttpError;
+
+    const RawResult = struct {
+        success: ?bool = null,
+        message: ?[]const u8 = null,
+    };
+    const parsed = std.json.parseFromSlice(
+        RawResult,
+        allocator,
+        resp_body.items,
+        .{ .ignore_unknown_fields = true },
+    ) catch return VoidNoteError.JsonParseError;
+    defer parsed.deinit();
+
+    const raw = parsed.value;
+    const message_copy = try allocator.dupe(u8, raw.message orelse "");
+
+    return SubmitPaymentResult{
+        .success = raw.success orelse (status == 200 or status == 201),
+        .message = message_copy,
+    };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
